@@ -140,6 +140,19 @@ post_publish '{"expected_revision":7,"changes":[
 ]}'
 site_status /docs/index.html
 
+echo "== 22) 发布含绝对站内链接（带查询串与片段）的首页（预期 200，revision=9）"
+post_publish '{"expected_revision":8,"changes":[
+  {"op":"upsert","path":"/index.html","content":"<h1 id=\"top\">首页</h1> <a href=\"/docs/index.html?lang=zh#body\">文档</a>"},
+  {"op":"upsert","path":"/docs/index.html","content":"<p id=\"body\">文档正文</p> <a href=\"../index.html#top\">回首页</a>"}
+]}'
+
+echo "== 23) /site 输出：绝对站内 href 已指向 /site 下（查询串与片段保留），点击即可打开"
+curl -sS "$BASE/site/index.html"; echo
+site_status /docs/index.html
+
+echo "== 24) /pages 与历史快照仍是发布原文（不带 /site 前缀）"
+curl -sS "$BASE/pages?revision=9"; echo
+
 echo "== 当前修订号与最终页面集合"
 curl -sS "$BASE/revision"; echo
 curl -sS "$BASE/pages"; echo

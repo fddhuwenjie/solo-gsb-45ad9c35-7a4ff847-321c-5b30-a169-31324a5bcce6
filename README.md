@@ -59,7 +59,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 首次启动自动建表
 | `GET /redirects` | 当前全部旧地址跳转 `{"redirects":{旧地址:真实路径}}` |
 | `POST /redirects` | 登记跳转，请求体 `{"path":"/old.html","target":"/real.html"}`；不推进修订号 |
 | `DELETE /redirects` | 撤销跳转，请求体 `{"path":"/old.html"}`；不推进修订号 |
-| `GET /site/{路径}` | 站点读取：真实路径返回 HTML；旧地址 308 指向真实路径；未知路径 404 |
+| `GET /site/{路径}` | 站点读取：真实路径返回 HTML（绝对站内 href 改写指到 `/site` 下）；旧地址 308 指向真实路径；未知路径 404 |
 
 ## 页面搬迁（`POST /relocate`）
 
@@ -110,7 +110,8 @@ curl -s -X POST http://localhost:8000/relocate \
 （`旧地址 -> 当前真实页面路径`，存于 SQLite，**重启后仍有效**）：
 
 - **站点读取** `GET /site/{路径}`：
-  - 真实页面路径 → `200` 返回 HTML 正文（`/site` 与 `/site/` 视为 `/index.html`）；
+  - 真实页面路径 → `200` 返回 HTML 正文（`/site` 与 `/site/` 视为 `/index.html`；
+    返回的 HTML 中绝对站内 href 已改写指到 `/site` 下，见下节）；
   - 已登记的旧地址 → `308 Permanent Redirect`，`Location` 指向站点内真实页面的
     URL（`/site` 前缀 + 真实路径），跟随一次即可拿到页面；
   - 未知路径 → `404`。
@@ -176,6 +177,50 @@ curl -s -X DELETE http://localhost:8000/redirects \
   -H 'Content-Type: application/json' \
   -d '{"path":"/legacy/home.html"}'
 # {"revoked":true,"path":"/legacy/home.html","revision":7}
+```
+
+## 站点读取（`/site`）：绝对站内 href 改写
+
+发布校验保证页面集合内的站内链接都能解析到真实页面，但浏览器打开
+`/site/index.html` 后，点击其中的**绝对站内 href**（如
+`<a href="/docs/guide.html?lang=zh#intro">`）会请求 `/docs/guide.html`——
+不在 `/site` 挂载之下，按路由只能 404。
+
+因此 `/site` 返回 HTML 时，把绝对站内 href（`/` 开头）改写为 `/site`
+前缀下的同名路径，**查询串与 `#片段` 原文保留**，点击后仍落在 `/site`
+可读取的页面上：
+
+- 相对链接（`docs/a.html`、`../x.html`）、纯片段（`#x`）、纯查询（`?x`）、
+  外部链接（`http(s)://`、`//host`、`mailto:` 等）与非链接 HTML
+  （正文、注释、其他标签及属性）一律原样返回；
+- 改写只作用于本次响应：数据库正文、`GET /pages` 与历史修订快照
+  （`GET /pages?revision=N`）始终返回发布原文；
+- 搬迁后链接仍到达新页面：存储正文中的 href 已随搬迁改指新路径，
+  `/site` 输出时再加前缀；旧址保持一次 `308` 直达 `/site` 下的真实页。
+
+```bash
+# 发布首页（含带查询串与片段的绝对站内链接）与真实目标页
+curl -s -X POST http://localhost:8000/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":0,"changes":[
+        {"op":"upsert","path":"/index.html",
+         "content":"<a href=\"/docs/guide.html?lang=zh#intro\">指南</a>"},
+        {"op":"upsert","path":"/docs/guide.html",
+         "content":"<h2 id=\"intro\">Guide</h2>"}]}'
+# {"revision":1,"published":true}
+
+# /site 返回的 HTML 中，绝对站内 href 指向 /site 下（查询串与片段保留）
+curl -s http://localhost:8000/site/index.html
+# <a href="/site/docs/guide.html?lang=zh#intro">指南</a>
+
+# 浏览器实际请求的地址（查询串原样携带）直接打开目标页
+curl -s -o /dev/null -w '%{http_code}\n' \
+  "http://localhost:8000/site/docs/guide.html?lang=zh"          # 200
+
+# /pages 与历史快照仍是发布原文（不带 /site 前缀）
+curl -s http://localhost:8000/pages
+# {"revision":1,"pages":{"/docs/guide.html":"<h2 id=\"intro\">Guide</h2>",
+#  "/index.html":"<a href=\"/docs/guide.html?lang=zh#intro\">指南</a>"}}
 ```
 
 ## 并行变更合入（`POST /merge`）
@@ -301,18 +346,20 @@ curl -s "http://localhost:8000/pages?revision=1"
 
 ```
 app/
-  db.py         # SQLite 连接、建表（meta/pages/redirects）、修订号元数据
-  linkcheck.py  # href 解析（相对/绝对/#片段/查询串/越界）与整批链接校验
-  publish.py    # 单写事务：试用整批改动 -> 跳转守护 + 校验 -> 提交；冲突/校验错误（/merge 复用其试用与入口页校验）
-  merge.py      # 单写事务：基线-当前路径比对 -> 并行合入 -> 跳转守护 + 整包校验 -> 新修订
-  relocate.py   # 单写事务：页面搬迁、站内 href 改写（沿用 linkcheck）、旧地址跳转联动、整包校验、新修订
-  redirects.py  # 旧地址跳转：登记/撤销（不推进修订号）、发布/合入/搬迁共用的跳转守护
-  main.py       # FastAPI 路由与请求模型（/publish、/merge、/relocate、/redirects 与 /site 站点读取）
-tests/          # pytest 端到端 + 链接解析/搬迁改写/并行合入/旧地址跳转单测
+  db.py          # SQLite 连接、建表（meta/pages/redirects）、修订号元数据
+  linkcheck.py   # href 解析（相对/绝对/#片段/查询串/越界）与整批链接校验
+  htmlrewrite.py # 字节级 <a href> 改写：只动 href 值，其余字节原样保留（relocate 与 /site 输出共用）
+  publish.py     # 单写事务：试用整批改动 -> 跳转守护 + 校验 -> 提交；冲突/校验错误（/merge 复用其试用与入口页校验）
+  merge.py       # 单写事务：基线-当前路径比对 -> 并行合入 -> 跳转守护 + 整包校验 -> 新修订
+  relocate.py    # 单写事务：页面搬迁、站内 href 改写（沿用 linkcheck/htmlrewrite）、旧地址跳转联动、整包校验、新修订
+  redirects.py   # 旧地址跳转：登记/撤销（不推进修订号）、发布/合入/搬迁共用的跳转守护
+  site.py        # /site 输出改写：绝对站内 href 加 /site 前缀（仅作用于读取响应，不改存储正文）
+  main.py        # FastAPI 路由与请求模型（/publish、/merge、/relocate、/redirects 与 /site 站点读取）
+tests/          # pytest 端到端 + 链接解析/搬迁改写/并行合入/旧地址跳转/站点输出改写单测
 Dockerfile
 docker-compose.yml
 entrypoint.sh   # 启动时初始化数据库再拉起 uvicorn
-examples.sh     # 可执行的 HTTP 调用示例（含旧地址跳转的访问、搬迁与冲突场景）
+examples.sh     # 可执行的 HTTP 调用示例（含 /site 输出改写、旧地址跳转的访问、搬迁与冲突场景）
 ```
 
 ## 测试

@@ -14,6 +14,7 @@ from .merge import MergeBaselineNotFound, MergeConflict, merge
 from .publish import INDEX, PublishConflict, PublishValidationError, publish
 from .redirects import RedirectValidationError, register_redirect, revoke_redirect
 from .relocate import relocate
+from .site import rewrite_html_for_site
 
 
 def _validate_page_path_format(v: str) -> str:
@@ -324,6 +325,10 @@ def serve_site(page_path: str = ""):
 
     ``/site`` 与 ``/site/`` 视为入口页 ``/index.html``；308 的 ``Location``
     指向站点内真实页面的 URL（``/site`` 前缀 + 真实路径）。
+    返回的 HTML 中绝对站内 href（``/`` 开头）改写为 ``/site`` 前缀下的同名
+    路径（查询串与 ``#片段`` 原文保留），使浏览器点击后仍落在 ``/site``
+    可读取的页面上；相对链接、纯片段、纯查询、外部链接与非链接 HTML 原样返回。
+    改写只作用于本次响应，``/pages`` 与历史修订快照保持发布原文。
     """
     site_path = "/" + page_path if page_path else INDEX
     conn = db.connect()
@@ -336,7 +341,7 @@ def serve_site(page_path: str = ""):
             (current, site_path),
         ).fetchone()
         if row is not None:
-            return HTMLResponse(content=row["content"])
+            return HTMLResponse(content=rewrite_html_for_site(row["content"]))
         row = conn.execute(
             "SELECT target FROM redirects WHERE path = ?", (site_path,)
         ).fetchone()
