@@ -59,7 +59,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 首次启动自动建表
 | `GET /redirects` | 当前全部旧地址跳转 `{"redirects":{旧地址:真实路径}}` |
 | `POST /redirects` | 登记跳转，请求体 `{"path":"/old.html","target":"/real.html"}`；不推进修订号 |
 | `DELETE /redirects` | 撤销跳转，请求体 `{"path":"/old.html"}`；不推进修订号 |
-| `GET /site/{路径}` | 站点读取：真实路径返回 HTML；旧地址 308 指向真实路径；未知路径 404 |
+| `GET /site/{路径}` | 站点读取：真实路径返回 HTML（绝对站内 href 改写为 `/site` 前缀地址）；旧地址 308 指向真实路径；未知路径 404 |
 
 ## 页面搬迁（`POST /relocate`）
 
@@ -104,13 +104,56 @@ curl -s -X POST http://localhost:8000/relocate \
   -d '{"expected_revision":1,"old_path":"/about.html","new_path":"/about2.html"}'
 ```
 
+## 站点读取（`/site`）的链接改写
+
+页面正文原样存储，`GET /pages`（含历史修订快照）返回的始终是发布时的原文；
+只有 `GET /site/{路径}` 返回 HTML 时**在内存中**改写链接，让浏览器里的站内
+跳转都落在 `/site` 前缀下（否则点击 `<a href="/docs/guide.html">` 会请求
+`/docs/guide.html`——那不是站点路由，按现有路由只能返回 404）：
+
+- **绝对站内 href**（以 `/` 开头）加上 `/site` 前缀，查询串与 `#片段` 原文保留：
+  `<a href="/docs/guide.html?lang=zh#intro">` 在 `/site/index.html` 的响应中变为
+  `<a href="/site/docs/guide.html?lang=zh#intro">`，点击即请求
+  `/site/docs/guide.html?lang=zh#intro`（200）；
+- **相对链接**（如 `../index.html`）不改——浏览器以 `/site/...` 为基准解析，
+  自然落在 `/site` 前缀下；**纯片段**（`#x`）、**纯查询**（`?x`）、
+  **外部链接**与**非链接 HTML**（正文、注释、其他标签及属性）一律原样返回；
+- 搬迁后存储中的链接已被改写到新路径，`/site` 响应里的链接随之指向 `/site`
+  下的新页面；旧址仍保持一次 `308` 直达 `/site` 下的真实页。
+
+```bash
+# 发布入口页（含绝对站内链接）与真实目标页（发布校验通过，revision -> 1）
+curl -s -X POST http://localhost:8000/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":0,"changes":[
+        {"op":"upsert","path":"/index.html",
+         "content":"<a href=\"/docs/guide.html?lang=zh#intro\">指南</a>"},
+        {"op":"upsert","path":"/docs/guide.html",
+         "content":"<h2 id=\"intro\">指南</h2>"}]}'
+
+# /site 返回的 HTML 中，绝对站内 href 已指向 /site 下的可读页面
+curl -s http://localhost:8000/site/index.html
+# <a href="/site/docs/guide.html?lang=zh#intro">指南</a>
+
+# 跟随改写后的链接 -> 200；不带 /site 前缀的地址不是站点路由 -> 404
+curl -s -o /dev/null -w '%{http_code}\n' \
+  "http://localhost:8000/site/docs/guide.html?lang=zh#intro"   # 200
+curl -s -o /dev/null -w '%{http_code}\n' \
+  "http://localhost:8000/docs/guide.html"                      # 404
+
+# 存储与快照不受读取影响：/pages 仍返回发布时的原文
+curl -s http://localhost:8000/pages
+# {"revision":1,"pages":{"/index.html":"<a href=\"/docs/guide.html?lang=zh#intro\">指南</a>", ...}}
+```
+
 ## 旧地址跳转（登记 / 撤销 / 站点读取）
 
 外部保存的旧页面地址在搬迁后仍应可访问。服务维护一张**跳转表**
 （`旧地址 -> 当前真实页面路径`，存于 SQLite，**重启后仍有效**）：
 
 - **站点读取** `GET /site/{路径}`：
-  - 真实页面路径 → `200` 返回 HTML 正文（`/site` 与 `/site/` 视为 `/index.html`）；
+  - 真实页面路径 → `200` 返回 HTML 正文（`/site` 与 `/site/` 视为 `/index.html`；
+    返回的 HTML 中绝对站内 href 已改写为 `/site` 前缀地址，见上节）；
   - 已登记的旧地址 → `308 Permanent Redirect`，`Location` 指向站点内真实页面的
     URL（`/site` 前缀 + 真实路径），跟随一次即可拿到页面；
   - 未知路径 → `404`。
@@ -307,8 +350,9 @@ app/
   merge.py      # 单写事务：基线-当前路径比对 -> 并行合入 -> 跳转守护 + 整包校验 -> 新修订
   relocate.py   # 单写事务：页面搬迁、站内 href 改写（沿用 linkcheck）、旧地址跳转联动、整包校验、新修订
   redirects.py  # 旧地址跳转：登记/撤销（不推进修订号）、发布/合入/搬迁共用的跳转守护
+  site.py       # /site 呈现层：返回 HTML 时把绝对站内 href 改写为 /site 前缀地址（不改存储与快照）
   main.py       # FastAPI 路由与请求模型（/publish、/merge、/relocate、/redirects 与 /site 站点读取）
-tests/          # pytest 端到端 + 链接解析/搬迁改写/并行合入/旧地址跳转单测
+tests/          # pytest 端到端 + 链接解析/搬迁改写/并行合入/旧地址跳转/站点链接改写单测
 Dockerfile
 docker-compose.yml
 entrypoint.sh   # 启动时初始化数据库再拉起 uvicorn
